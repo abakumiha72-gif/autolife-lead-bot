@@ -148,7 +148,7 @@ def handle_update(u):
     text = m.get("text") or ""
     if not cid:
         return
-    if text.startswith("/start") or text.startswith("/checklist"):
+    if text.strip().lower() in ("start", "/start", "/checklist", "начать"):
         send(cid, HELLO, keyboard(0))
     elif text.startswith("/help"):
         send(cid, "Нажмите /start — и я задам 4 коротких вопроса о вашем процессе.")
@@ -171,13 +171,26 @@ def start_offset():
     return 0
 
 
+def notify_alive():
+    """Пишем Ольге при каждом старте: так видно, что контейнер жив."""
+    try:
+        send(ADMIN, "✅ Бот запущен (Bothost). Проверка связи — если вы видите это сообщение, "
+                    "бот работает и принимает заявки.")
+    except Exception as e:
+        print("notify fail", e, flush=True)
+
+
 def main():
     api("deleteWebhook", drop_pending_updates="false")
     offset = start_offset()
     print("bot started (long polling), offset =", offset, flush=True)
+    print("admin =", ADMIN, "| data_dir =", DATA_DIR, "| lead_chat =", bool(LEAD_CHAT), flush=True)
+    notify_alive()
     while True:
         try:
             ups = api("getUpdates", offset=offset, timeout=30) or []
+            if ups:
+                print("got", len(ups), "update(s)", flush=True)
             for u in ups:
                 offset = u["update_id"] + 1
                 try:
