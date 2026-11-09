@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: autolife-lead-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: LEAD_CHAT_ID
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: LANDING_URL
+        sync: false
+      - key: CHECKLIST_URL
+        sync: false
