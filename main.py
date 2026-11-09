@@ -1,21 +1,35 @@
 # -*- coding: utf-8 -*-
 """
 Бот канала «Авто Жизнь с Мирой» — приём заявок.
-Stateless: состояние диалога кодируется в тексте сообщения, поэтому перезапуск
-сервера ничего не теряет. Заявки уходят сразу в Telegram (в личку админа и,
-если задан LEAD_CHAT_ID, в отдельный чат-канал).
+Режим long polling: не нужен внешний HTTPS-адрес, состояние диалога кодируется
+в тексте сообщения (stateless). Заявки уходят сразу в Telegram — их нельзя потерять.
 """
-import os, json, hmac, hashlib, requests
-from flask import Flask, request, jsonify
+import os, json, time, requests
 
-TOK = os.environ["BOT_TOKEN"]
+
+def read_token():
+    t = os.environ.get("BOT_TOKEN", "").strip()
+    if t:
+        return t
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in ("/app/token.txt", "/app/data/token.txt",
+                 os.path.join(here, "token.txt")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                v = f.read().strip()
+                if v:
+                    return v
+        except Exception:
+            continue
+    raise RuntimeError("BOT_TOKEN не найден: env-переменная или файл token.txt")
+
+
+TOK = read_token()
 BASE = f"https://api.telegram.org/bot{TOK}"
 ADMIN = int(os.environ.get("ADMIN_ID", "1213874390"))
 LEAD_CHAT = os.environ.get("LEAD_CHAT_ID", "").strip()
 LANDING = os.environ.get("LANDING_URL", "https://avtozhizn-svyazka-wtdaf6ev.agent.mira.tg")
 CHECKLIST = os.environ.get("CHECKLIST_URL", "https://chek-list-avtomatizaciya-wtdaf6ev.agent.mira.tg")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 Q = [
     ("process", "Что отнимает больше всего времени и повторяется?",
@@ -32,18 +46,16 @@ HELLO = ("👋 Привет! Я бот канала «Авто Жизнь с М�
          "Помогу за 10 минут понять, что в вашем процессе стоит автоматизировать первым.\n\n"
          "Ответьте на пару вопросов — и я передам заявку Ольге, она свяжется с вами.")
 
-app = Flask(__name__)
-
 
 def api(method, **kw):
     try:
-        r = requests.post(f"{BASE}/{method}", timeout=25, data=kw)
+        r = requests.post(f"{BASE}/{method}", timeout=60, data=kw)
         j = r.json()
         if not j.get("ok"):
-            print("api error", method, j.get("description"))
+            print("api error", method, j.get("description"), flush=True)
         return j.get("result")
     except Exception as e:
-        print("api fail", method, e)
+        print("api fail", method, e, flush=True)
         return None
 
 
@@ -56,10 +68,7 @@ def send(chat_id, text, buttons=None):
 
 def edit(chat_id, message_id, text, buttons=None):
     kw = {"chat_id": chat_id, "message_id": message_id, "text": text}
-    if buttons:
-        kw["reply_markup"] = json.dumps({"inline_keyboard": buttons}, ensure_ascii=False)
-    else:
-        kw["reply_markup"] = json.dumps({"inline_keyboard": []}, ensure_ascii=False)
+    kw["reply_markup"] = json.dumps({"inline_keyboard": buttons or []}, ensure_ascii=False)
     return api("editMessageText", **kw)
 
 
@@ -68,15 +77,11 @@ def keyboard(step):
 
 
 def state_text(answers, step):
-    """Состояние диалога хранится в тексте сообщения — сервер stateless."""
     payload = "|".join(f"{k}={answers.get(k,'')}" for k, _, _ in Q)
-    if step < len(Q):
-        return f"[state:{step}:{payload}]\n\n❓ **{Q[step][1]}**"
-    return f"[state:{step}:{payload}]"
+    return f"[state:{step}:{payload}]\n\n❓ **{Q[step][1]}**"
 
 
 def parse_state(text):
-    """Восстанавливает состояние из текста сообщения."""
     if not text or "[state:" not in text:
         return 0, {}
     try:
@@ -109,7 +114,7 @@ def deliver(chat_id, name, username, answers):
     send(ADMIN, text)
     if LEAD_CHAT:
         send(LEAD_CHAT, text)
-    print("LEAD", chat_id, name, answers)
+    print("LEAD", chat_id, name, answers, flush=True)
 
 
 def handle_update(u):
@@ -149,37 +154,46 @@ def handle_update(u):
         send(cid, "Нажмите /start — и я задам 4 коротких вопроса о вашем процессе.")
 
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    if WEBHOOK_SECRET:
-        h = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if not hmac.compare_digest(h, WEBHOOK_SECRET):
-            return "forbidden", 403
-    u = request.get_json(silent=True) or {}
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
+
+
+def start_offset():
+    """Продолжаем с последнего обработанного апдейта, чтобы не переигрывать
+    старые сообщения при перезапуске."""
     try:
-        handle_update(u)
-    except Exception as e:
-        print("handler error", e)
-    return "ok", 200
+        with open(os.path.join(DATA_DIR, "offset.txt"), encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception:
+        pass
+    last = api("getUpdates", offset=-1, timeout=0, limit=1) or []
+    if last:
+        return last[-1]["update_id"] + 1
+    return 0
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return "ok", 200
-
-
-@app.route("/setwebhook", methods=["GET"])
-def setwebhook():
-    if not PUBLIC_URL:
-        return "no PUBLIC_URL", 400
-    if WEBHOOK_SECRET:
-        api("setWebhook", url=f"{PUBLIC_URL}/webhook", secret_token=WEBHOOK_SECRET,
-            allowed_updates=["message", "callback_query"])
-    else:
-        api("setWebhook", url=f"{PUBLIC_URL}/webhook", allowed_updates=["message", "callback_query"])
-    return "webhook set: " + PUBLIC_URL, 200
+def main():
+    api("deleteWebhook", drop_pending_updates="false")
+    offset = start_offset()
+    print("bot started (long polling), offset =", offset, flush=True)
+    while True:
+        try:
+            ups = api("getUpdates", offset=offset, timeout=30) or []
+            for u in ups:
+                offset = u["update_id"] + 1
+                try:
+                    handle_update(u)
+                except Exception as e:
+                    print("handler error", e, flush=True)
+                try:
+                    os.makedirs(DATA_DIR, exist_ok=True)
+                    with open(os.path.join(DATA_DIR, "offset.txt"), "w", encoding="utf-8") as f:
+                        f.write(str(offset))
+                except Exception:
+                    pass
+        except Exception as e:
+            print("poll error", e, flush=True)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+    main()
